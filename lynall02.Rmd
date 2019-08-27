@@ -1,0 +1,837 @@
+---
+title: "lynall02"
+output: html_document
+---
+
+## Contents:
+- Clustering by multivariate mixture modeling
+- Subsampling and consensus clustering
+- Plots for Figure 5 and Figure S7 
+- Data for Table S5
+
+```{r}
+
+# library(devtools); install_version("mclust", version = "5.4", repos = "http://cran.us.r-project.org")
+# Using clue_0.3-56
+
+library(mclust)
+library(magrittr)
+library(dplyr)
+library(here)
+library(clue)
+library(ggplot2)
+library(ggsignif)
+
+load(file = paste0(here::here("res/"),"Apollo_qm_combi.Rdata"))
+
+choice_qset <- c("q_rbc","q_platelet","q_baso","q_eosin","q_neut","q_mono_class","q_mono_int","q_mono_nonclass","q_cd4","q_cd8","q_b","q_nkt","q_nk16","q_nk56")
+labels_qset <- c(q_rbc="RBCs",q_platelet="Platelets",q_baso="Basophils",q_eosin="Eosinophils",q_neut="Neutrophils",q_mono_class="Mono (classical)",q_mono_int="Mono (int)",q_mono_nonclass="Mono (non-class)",q_cd4="CD4+ T",q_cd8="CD8+ T",q_b="B cells",q_nkt="NKT cells",q_nk16="CD16(hi) NK",q_nk56="CD56(hi) NK")
+
+mdd <- qm_combi[qm_combi$disorder=="MDD",]
+
+```
+
+Basic clustering without subsampling
+```{r}
+
+# Now make the model
+set.seed(222)
+mod1 <- Mclust(mdd[,c(choice_qset)]) 
+summary(mod1, parameters = FALSE)
+
+# Version using ICL rather than BIC
+set.seed(111)
+ICL <- mclustICL(mdd[,c(choice_qset)]) # 5 mins
+summary(ICL) # Gives same answer as BIC i.e. that 4 component VVI is the best choice
+
+# 4 clusters
+mdd$mclust <- factor(mod1$classification, levels=c("1","2","3","4"), ordered=TRUE)
+mdd %>% group_by(mclust) %>% dplyr::summarise_at(vars(ham_17_score),median)
+
+mdd$mclust %<>% forcats::fct_recode("1"="2","2"="3","3"="1","4"="4") 
+mdd$mclust %<>% factor(levels=c("1","2","3","4"), ordered=TRUE)
+
+```
+
+Subsampling and consensuse clustering of MDD participants
+```{r}
+library(clue) # Kurt Hornik
+
+set.seed(222)
+
+nr <- NROW(mdd)
+set.seed(222)
+tmp2 <- replicate(5000, expr = { 
+  out <- Mclust(mdd[sample(nr, 0.9 * nr, replace = FALSE),choice_qset],modelNames = "VVI", verbose = FALSE) # Allowing number of clusters to vary 1:9 as per default, VVI chosen as best model for whole sample. Sample 90% of rows without replacement
+  as.cl_partition(cl_predict(out, mdd[,choice_qset], "memberships"))
+}, simplify = FALSE) 
+tmp3 <- cl_ensemble(list=tmp2)
+
+set.seed(222)
+tmp4 <- cl_consensus(tmp3) # consensus clustering
+meta_subsample <- cl_class_ids(tmp4); table(meta_subsample) 
+
+```
+
+Plot metaclustering results
+```{r}
+
+mdd$meta_subsample <- as.factor(meta_subsample)
+mdd %>% group_by(meta_subsample) %>% summarise_at(vars(ham_17_score),median)
+# 15, 18, 18 and 19.5
+
+# MANUAL annotation to order by HAM-D
+mdd$meta_subsample %<>% forcats::fct_recode("C0"="3","C1"="4","C2"="5","C3"="1") # new = old
+mdd$meta_subsample %<>% factor(levels=c("C0","C1","C2","C3"), ordered=TRUE)
+
+mdd$cluster_id <- mdd$meta_subsample 
+save(mdd, file = paste(here::here("res/"),"Apollo_mdd_clust_out_meta.Rdata",sep=""))
+
+meta_subsample <- mdd$meta_subsample 
+save(meta_subsample, file = paste(here::here("res/"),"Apollo_mdd_meta_subsample.R",sep=""))
+
+# Compare simple mclust with subsampled version. 
+table(mdd$mclust, mdd$meta_subsample) 
+
+```
+
+Function for clustering plot
+```{r}
+make_4_cluster_plot <- function(data=m, basedir=NULL, picpath=NULL, cluster_fx=choice_qset, cols=clustercols, levels=levels, suffix=""){
+  
+  vjust <- 0.5
+  step_increase <- 0.12
+  print(paste("Number of samples finally included in clustering = ",dim(data)[1],sep=""))
+  
+  nclust <- length(levels(data$cluster_id))
+  
+  ching <- function(data=NULL, dependent=NULL){
+    chi1 <- chisq.test(t(table(data[,dependent], data$cluster_id)),simulate.p.value = TRUE) 
+    print(paste("Chis for variable:",dependent))
+    print(t(table(droplevels(data[,dependent]), data$cluster_id)))
+    
+    chis <- NCStats::chisqPostHoc(chi1, popsInRows = TRUE, control = "BH",digits = 4, verbose = TRUE)
+    if(chi1$p.value<=0.05){ # Set to NA if the overall chi-squared not sig
+      chis <- chis
+    } else {
+      chis[,c(2,3)] <- NA
+    }
+    chis$comparison %<>% as.character 
+    chis <- rbind(data.frame(chis),c("overall",NA,chi1$p.value))
+    rownames(chis) <- chis$comparison
+    return(chis)
+  }
+  
+  categoricals <- c("macs_flow_centre","infections","lynall_inflamm_yn","tobacco_yn","alcohol_yn","cannabis_yn","current_antidepress_yn", "sex")
+  
+  all_ching <- lapply(categoricals, function(x) {ching(data=data,dependent=x)})
+  names(all_ching) <- categoricals 
+  list.condition <- sapply(all_ching, function(x) as.numeric(x["overall","adj.p"])<=0.05)
+  
+  # NOW SOME KRUSKAL-WALLIS AND CONOVER-IVAN STATS
+  print("Now KW for continuous variables")
+  krusking <- function(data=NULL, dependent=NULL){
+    kruk <- PMCMRplus::kruskalTest(get(dependent) ~ cluster_id, data=data)
+    conov <- PMCMRplus::kwAllPairsConoverTest(get(dependent) ~ cluster_id, data=data, p.adjust.method="BH")
+    conov <- conov$p.value # This is the ADJUSTED p value
+    print(paste("Post-hoc Conover-Ivan (even if KW not significant), p-vals are adjusted, for",dependent))
+    print(conov)
+    if(kruk$p.value<=0.05){ # Set to NA if the overall chi-squared not significant
+      conov <- conov
+    } else {
+      conov[,] <- NA
+    }
+    kruker <- list("p.value"=kruk$p.value, "conov"=conov)
+    print(paste("Kruskal for variable:",dependent))
+    print(kruker$p.value)
+    cat("\n\n\n")
+    return(kruker)
+  }
+  
+  numerics <- c(cluster_fx,"bmi_calculated","age_at_bloods","crp_macs","p_il_6_mean","ham_17_score","ctq_total_score","chalder_fatigue_score","bdi_total_score","shaps_score_calc","t_anxiety_score","s_anxiety_score","antidepress_failed_75_less", "leq_z","triglycerides")
+  
+  all_krusking <- lapply(numerics, function(x) {krusking(data=data,dependent=x)}) 
+  names(all_krusking) <- numerics 
+  
+  p_sex <- ggplot(data=data, aes(sex, fill = cluster_id, label=..count..)) + geom_bar(position = "fill") + 
+    scale_y_continuous(labels = scales::percent) + xlab("") + ylab("") + 
+    ggtitle("Sex\n") + scale_fill_manual(values=cols) + guides(fill=FALSE) + 
+    theme_bw() + theme(axis.text.x=element_text(angle=90,hjust=1, vjust=0.5)) + 
+    geom_text(stat="count",position="fill",vjust=1)
+  
+  p_infec <- ggplot(data=data[!is.na(data$infections),], aes(droplevels(infections), fill = cluster_id, label=..count..)) + geom_bar(position = "fill") + 
+    scale_y_continuous(labels = scales::percent) + xlab("") + ylab("") + 
+    ggtitle("Infection\nstatus\n") + scale_fill_manual(values=cols) + guides(fill=FALSE) + 
+    theme_bw() + theme(axis.text.x=element_text(angle=90,hjust=1, vjust=0.5)) + 
+    geom_text(stat="count",position="fill",vjust=1)
+  
+  p_inflamm <- ggplot(data=data[!is.na(data$lynall_inflamm_yn),], aes(droplevels(lynall_inflamm_yn), fill = cluster_id, label=..count..)) + geom_bar(position = "fill") + 
+    scale_y_continuous(labels = scales::percent) + xlab("") + ylab("") + 
+    ggtitle("Minor\ninflammatory\ndisease") + scale_fill_manual(values=cols) + guides(fill=FALSE) + 
+    theme_bw() + theme(axis.text.x=element_text(angle=90,hjust=1, vjust=0.5)) + 
+    geom_text(stat="count",position="fill",vjust=1)
+  
+  p_tobacco <- ggplot(data=data[!is.na(data$tobacco_yn),], aes(tobacco_yn, fill = cluster_id, label=..count..)) + geom_bar(position = "fill") + 
+    scale_y_continuous(labels = scales::percent) + xlab("") + ylab("") + 
+    ggtitle("Current\ntobacco use\n") + scale_fill_manual(values=cols) + guides(fill=FALSE) + 
+    theme_bw() + theme(axis.text.x=element_text(angle=90,hjust=1, vjust=0.5)) + 
+    geom_text(stat="count",position="fill",vjust=1)
+  
+  p_alcohol <- ggplot(data=data[!is.na(data$alcohol_yn),], aes(alcohol_yn, fill = cluster_id, label=..count..)) + geom_bar(position = "fill") + 
+    scale_y_continuous(labels = scales::percent) + xlab("") + ylab("") + 
+    ggtitle("Current\nalcohol use\n") + scale_fill_manual(values=cols) + guides(fill=FALSE) + 
+    theme_bw() + theme(axis.text.x=element_text(angle=90,hjust=1, vjust=0.5)) + 
+    geom_text(stat="count",position="fill",vjust=1)
+  
+  p_cannabis <- ggplot(data=data[!is.na(data$cannabis_yn),], aes(cannabis_yn, fill = cluster_id, label=..count..)) + geom_bar(position = "fill") + 
+    scale_y_continuous(labels = scales::percent) + xlab("") + ylab("") + 
+    ggtitle("Current\ncannabis use\n") + scale_fill_manual(values=cols) + guides(fill=FALSE) + 
+    theme_bw() + theme(axis.text.x=element_text(angle=90,hjust=1, vjust=0.5)) + 
+    geom_text(stat="count",position="fill",vjust=1)
+  
+  p_propAD <- ggplot(data=data[!is.na(data$current_antidepress_yn),], aes(current_antidepress_yn, fill = cluster_id, label=..count..)) + geom_bar(position = "fill") + 
+    scale_y_continuous(labels = scales::percent) + xlab("") + ylab("") + 
+    ggtitle("Current anti-\ndepressant\ntreatment\n") + scale_fill_manual(values=cols) + 
+    theme_bw() + theme(axis.text.x=element_text(angle=90,hjust=1, vjust=0.5)) + 
+    guides(fill=FALSE) + 
+    geom_text(stat="count",position="fill",vjust=1)
+  
+  p_mc <- ggplot(data=data, aes(x=cluster_id, y=q_mono_class)) + xlab("") + ylab("") + 
+    ggtitle("Classical\nmonocytes") + geom_violin(adjust=2)  + geom_boxplot(aes(fill=cluster_id),outlier.shape=NA, notch=FALSE, width=0.2) + scale_fill_manual(values=clustercols)+ guides(fill=FALSE) + expand_limits(y=0) + theme_bw() 
+  
+  p_mi <- ggplot(data=data, aes(x=cluster_id, y=q_mono_int)) + xlab("") + ylab("") + 
+    ggtitle("Intermediate\nmonocytes") + geom_violin(adjust=2)  + geom_boxplot(aes(fill=cluster_id),outlier.shape=NA, notch=FALSE, width=0.2) + scale_fill_manual(values=clustercols) + guides(fill=FALSE) + expand_limits(y=0)+ theme_bw() 
+  
+  p_mnc <- ggplot(data=data, aes(x=cluster_id, y=q_mono_nonclass)) + xlab("") + ylab("") + 
+    ggtitle("Non-classical\nmonocytes") + geom_violin(adjust=2)  + geom_boxplot(aes(fill=cluster_id),outlier.shape=NA, notch=FALSE, width=0.2) + scale_fill_manual(values=clustercols) + guides(fill=FALSE) + expand_limits(y=0)+ theme_bw() 
+  
+  p_b <- ggplot(data=data, aes(x=cluster_id, y=q_b)) + xlab("") + ylab("") + 
+    ggtitle("B cells") + geom_violin(adjust=2)+ geom_boxplot(aes(fill=cluster_id),outlier.shape=NA, notch=FALSE, width=0.2) + scale_fill_manual(values=clustercols) + guides(fill=FALSE)  + expand_limits(y=0) + theme_bw() 
+  
+  p_cd4 <- ggplot(data=data, aes(x=cluster_id, y=q_cd4)) + xlab("") + ylab("") + 
+    ggtitle("CD4+\nT cells") + geom_violin(adjust=2)+ geom_boxplot(aes(fill=cluster_id),outlier.shape=NA, notch=FALSE, width=0.2) + scale_fill_manual(values=clustercols) + guides(fill=FALSE) + expand_limits(y=0) + theme_bw()
+  
+  p_cd8 <- ggplot(data=data, aes(x=cluster_id, y=q_cd8)) + xlab("") + ylab("") + 
+    ggtitle("CD8+\nT cells") + geom_violin(adjust=2)+ geom_boxplot(aes(fill=cluster_id),outlier.shape=NA, notch=FALSE, width=0.2) + scale_fill_manual(values=clustercols) + guides(fill=FALSE) + expand_limits(y=0) + theme_bw()
+  
+  p_nk16 <- ggplot(data=data, aes(x=cluster_id, y=q_nk16)) + xlab("") + ylab("") + 
+    ggtitle("CD16hi\nNK cells") + geom_violin(adjust=2)+ geom_boxplot(aes(fill=cluster_id),outlier.shape=NA, notch=FALSE, width=0.2) + scale_fill_manual(values=clustercols) + guides(fill=FALSE) + expand_limits(y=0) + theme_bw()
+  
+  p_nk56 <- ggplot(data=data, aes(x=cluster_id, y=q_nk56)) + xlab("") + ylab("") + 
+    ggtitle("CD56hi\nNK cells") + geom_violin(adjust=2)+ geom_boxplot(aes(fill=cluster_id),outlier.shape=NA, notch=FALSE, width=0.2) + scale_fill_manual(values=clustercols) + guides(fill=FALSE) + expand_limits(y=0) + theme_bw()
+  
+  p_nkt <- ggplot(data=data, aes(x=cluster_id, y=q_nkt)) + xlab("") + ylab("") + 
+    ggtitle("NKT\ncells") + geom_violin(adjust=2)+ geom_boxplot(aes(fill=cluster_id),outlier.shape=NA, notch=FALSE, width=0.2) + scale_fill_manual(values=clustercols) + guides(fill=FALSE) + expand_limits(y=0) + theme_bw()
+  
+  p_neut <- ggplot(data=data, aes(x=cluster_id, y=q_neut)) + xlab("") + ylab("") + 
+    ggtitle("Neutrophils") + geom_violin(adjust=2)+ geom_boxplot(aes(fill=cluster_id),outlier.shape=NA, notch=FALSE, width=0.2) + scale_fill_manual(values=clustercols) + guides(fill=FALSE) + expand_limits(y=0) + theme_bw() 
+  
+  p_eosin <- ggplot(data=data, aes(x=cluster_id, y=q_eosin)) + xlab("") + ylab("") + 
+    ggtitle("Eosinophils") + geom_violin(adjust=2)+ geom_boxplot(aes(fill=cluster_id),outlier.shape=NA, notch=FALSE, width=0.2) + scale_fill_manual(values=clustercols) + guides(fill=FALSE) + expand_limits(y=0) + theme_bw()
+  
+  p_platelet <- ggplot(data=data, aes(x=cluster_id, y=q_platelet)) + xlab("") + ylab("") + 
+    ggtitle("Platelets") + geom_violin(adjust=2)+ geom_boxplot(aes(fill=cluster_id),outlier.shape=NA, notch=FALSE, width=0.2) + scale_fill_manual(values=clustercols) + guides(fill=FALSE)  + expand_limits(y=0) + theme_bw()
+  
+  p_baso <- ggplot(data=data, aes(x=cluster_id, y=q_baso)) + xlab("") + ylab("") + 
+    ggtitle("Basophils") + geom_violin(adjust=2)+ geom_boxplot(aes(fill=cluster_id),outlier.shape=NA, notch=FALSE, width=0.2) + scale_fill_manual(values=clustercols) + guides(fill=FALSE) + expand_limits(y=0) + theme_bw()
+  
+  p_rbc <- ggplot(data=data, aes(x=cluster_id, y=q_rbc)) + xlab("") + ylab("") + 
+    ggtitle("RBCs") + geom_violin(adjust=2)+ geom_boxplot(aes(fill=cluster_id),outlier.shape=NA, notch=FALSE, width=0.2) + scale_fill_manual(values=clustercols) + guides(fill=FALSE)  + expand_limits(y=0) + theme_bw()
+  
+  p_crp <- ggplot(data=data, aes(x=cluster_id, y=crp_macs)) + xlab("") + ylab("mg/L") + 
+    ggtitle("CRP") + geom_violin(adjust=2)  + scale_y_log10() + geom_boxplot(aes(fill=cluster_id),outlier.shape=NA, notch=FALSE, width=0.2) + scale_fill_manual(values=clustercols) + guides(fill=FALSE) + theme_bw() 
+  
+  p_il6 <- ggplot(data=data, aes(x=cluster_id, y=p_il_6_mean)) + xlab("") + ylab("pg/ml") + 
+    ggtitle("Plasma IL-6") + geom_violin(adjust=2)  + scale_y_log10(labels = function(x) format(x, scientific = FALSE)) + geom_boxplot(aes(fill=cluster_id),outlier.shape=NA, notch=FALSE, width=0.2) + scale_fill_manual(values=clustercols) + guides(fill=FALSE) + 
+    theme_bw()
+  
+  p_triglycerides <- ggplot(data=data, aes(x=cluster_id, y=triglycerides)) + xlab("") + ylab("mmol/L") + 
+    ggtitle("Triglycerides") + geom_violin(adjust=2) + scale_y_log10(labels = function(x) format(x, scientific = FALSE)) + geom_boxplot(aes(fill=cluster_id),outlier.shape=NA, notch=FALSE, width=0.2) + scale_fill_manual(values=clustercols) + guides(fill=FALSE) + 
+    theme_bw()
+  
+  p_hamd17 <- ggplot(data=data, aes(x=cluster_id, y=ham_17_score)) + xlab("") + ylab("Total score") + 
+    ggtitle("HAM-D\ntotal score") + geom_violin(adjust=2)  + geom_boxplot(aes(fill=cluster_id),outlier.shape=NA, notch=FALSE, width=0.2) + scale_fill_manual(values=clustercols) + guides(fill=FALSE)  + 
+    expand_limits(y=c(0)) + theme_bw() 
+  
+  p_chald <- ggplot(data=data, aes(x=cluster_id, y=chalder_fatigue_score)) + xlab("") + ylab("") + 
+    ggtitle("Chalder fatigue\nrating") + geom_violin(adjust=2)  + geom_boxplot(aes(fill=cluster_id),outlier.shape=NA, notch=FALSE, width=0.2) + scale_fill_manual(values=clustercols) + guides(fill=FALSE)  + 
+    expand_limits(y=c(0)) + theme_bw() # 
+  
+  p_ctq <- ggplot(data=data, aes(x=cluster_id, y=ctq_total_score)) + xlab("") + ylab("Total score") + 
+    ggtitle("Childhood\ntrauma score") + geom_violin(adjust=2)  + geom_boxplot(aes(fill=cluster_id), outlier.shape=NA, notch=FALSE, width=0.2) + scale_fill_manual(values=clustercols) + guides(fill=FALSE)  + expand_limits(y=c(0)) + 
+    theme_bw() 
+  
+  p_leq_z <- ggplot(data=data, aes(x=cluster_id, y=leq_z)) + xlab("") + ylab("Z-score") + 
+    ggtitle("Recent\nstressors") + geom_violin(adjust=2)  + geom_boxplot(aes(fill=cluster_id),outlier.shape=NA, notch=FALSE, width=0.2) + scale_fill_manual(values=clustercols) + guides(fill=FALSE) + theme_bw()
+  
+  p_bmi <- ggplot(data=data, aes(x=cluster_id, y=bmi_calculated)) + xlab("") + ylab("") + 
+    ggtitle("BMI\n") + geom_violin(adjust=2)  + geom_boxplot(aes(fill=cluster_id),outlier.shape=NA, notch=FALSE, width=0.2) + scale_fill_manual(values=clustercols) + guides(fill=FALSE) + 
+    expand_limits(y=c(0)) + theme_bw() #  
+  
+  p_age <- ggplot(data=data, aes(x=cluster_id, y=age_at_bloods)) + xlab("") + ylab("Years") + 
+    ggtitle("Age\n") + geom_violin(adjust=2)  + geom_boxplot(aes(fill=cluster_id),outlier.shape=NA, notch=FALSE, width=0.2) + scale_fill_manual(values=clustercols) + guides(fill=FALSE) + 
+    expand_limits(y=c(0)) + theme_bw() 
+  
+  p_centre <- ggplot(data=data, aes(macs_flow_centre, fill = cluster_id, label=..count..)) + geom_bar(position = "fill") + ggtitle("Clinical\ncentre") + scale_fill_manual(values=clustercols) + 
+    theme_bw() + theme(axis.text.x=element_text(angle=90,hjust=1, vjust=0.5)) + xlab("") + ylab("Participants") +
+    ggtitle("Study centre\n") + theme(axis.text.x=element_text(angle=90,hjust=1, vjust=0.5)) + expand_limits(y=0) + 
+    geom_text(stat="count",position="fill",vjust=1)
+  
+  p_bdi <- ggplot(data=data, aes(x=cluster_id, y=bdi_total_score)) + xlab("") + ylab("") + 
+    ggtitle("BDI\nscore") + geom_violin(adjust=2)  + geom_boxplot(aes(fill=cluster_id),outlier.shape=NA, notch=FALSE, width=0.2) + scale_fill_manual(values=clustercols) + guides(fill=FALSE)  + 
+    expand_limits(y=c(0)) + 
+    theme_bw() 
+  
+  p_shaps <- ggplot(data=data, aes(x=cluster_id, y=shaps_score_calc)) + xlab("") + ylab("") + 
+    ggtitle("SHAPS score\n(anhedonia)") + geom_violin(adjust=2)  + geom_boxplot(aes(fill=cluster_id),outlier.shape=NA, notch=FALSE, width=0.2) + scale_fill_manual(values=clustercols) + guides(fill=FALSE)  + 
+    expand_limits(y=c(0)) + 
+    theme_bw()
+  
+  # Trait anxiety
+  p_stai_t <- ggplot(data=data, aes(x=cluster_id, y=t_anxiety_score)) + xlab("") + ylab("") + 
+    ggtitle("STAI\n(trait anxiety)") + geom_violin(adjust=2)  + geom_boxplot(aes(fill=cluster_id),outlier.shape=NA, notch=FALSE, width=0.2) + scale_fill_manual(values=clustercols) + guides(fill=FALSE)  + 
+    expand_limits(y=c(0)) + 
+    theme_bw()
+  
+  # State anxiety
+  p_stai_s <- ggplot(data=data, aes(x=cluster_id, y=s_anxiety_score)) + xlab("") + ylab("") + 
+    ggtitle("STAI\n(state anxiety)") + geom_violin(adjust=2) + geom_boxplot(aes(fill=cluster_id),outlier.shape=NA, notch=FALSE, width=0.2) + scale_fill_manual(values=clustercols) + guides(fill=FALSE)  + 
+    expand_limits(y=c(0)) + 
+    theme_bw()
+  
+  p_failed75 <- ggplot(data=data, aes(x=cluster_id, y=antidepress_failed_75_less)) + xlab("") + ylab("# of ineffective treatments") + 
+    ggtitle("Antidepressant\nnon-response") + geom_violin(adjust=2) + 
+    geom_boxplot(aes(fill=cluster_id),outlier.shape=NA, notch=FALSE, width=0.2) + 
+    scale_fill_manual(values=clustercols) + guides(fill=FALSE) + 
+    expand_limits(y=c(0)) + guides(fill=FALSE) + scale_y_continuous(breaks=c(0,2,4,6,8)) +
+    theme_bw()
+  
+  plist_numeric <- list(p_b=p_b,p_mc=p_mc,p_mi=p_mi,p_mnc=p_mnc,p_nk16=p_nk16,p_nk56=p_nk56,p_nkt=p_nkt,p_cd4=p_cd4,p_cd8=p_cd8,p_neut=p_neut,p_eosin=p_eosin,p_baso=p_baso,p_rbc=p_rbc,p_platelet=p_platelet,p_bmi=p_bmi,p_age=p_age,p_crp=p_crp,p_il6=p_il6,p_hamd17=p_hamd17,p_ctq=p_ctq,p_chald=p_chald,p_bdi=p_bdi,p_shaps=p_shaps,p_stai_t=p_stai_t,p_stai_s=p_stai_s,p_failed75=p_failed75, p_leq_z=p_leq_z, p_triglycerides=p_triglycerides)
+  plist_categ <- list(p_centre,p_sex,p_infec,p_inflamm,p_tobacco)
+  
+  # Function for post-hoc conover-ivan
+  add_conover4 <- function(x){
+    y <- all.vars(x$mapping$y)
+    print(y)
+    cv <- all_krusking[[y]]$conov
+    cvpadjs <- c(cv[1,1],cv[2,2],cv[3,3],cv[2,1],cv[3,2],cv[3,1]) # To match the order in geom_signif below
+    cvshort <- cvpadjs[cvpadjs<0.05]
+    compshort <- list(c(levels[1],levels[2]),c(levels[2],levels[3]),c(levels[3],levels[4]),c(levels[1],levels[3]),c(levels[2],levels[4]),c(levels[1],levels[4]))[cvpadjs<0.05] # Drop if not significant after adjusting 
+    if(length(compshort)){
+      plot <- x + geom_signif(comparisons = compshort, 
+                              annotations=as.vector(symnum(cvshort, numeric.x=TRUE,corr = FALSE, na = TRUE, legend=FALSE,cutpoints = c(0, 0.001, 0.01, 0.05, 1), symbols = c("***", "**", "*", "ns"))),
+                              step_increase=step_increase, textsize=5,margin_top=0.15,vjust=1.2) 
+    } else {plot <- x}
+    return(plot)
+  }
+  
+  plist_numeric <- lapply(plist_numeric,add_conover4)
+  
+  # Make blank graph for spacing
+  df <- data.frame()
+  blank <- ggplot(df) + geom_blank(inherit.aes=FALSE) + theme_bw() + theme(panel.border = element_blank())
+  
+  graphs_immuno <- list(plist_numeric$p_crp, plist_numeric$p_il6)
+  
+  
+  graphs_input <- list(plist_numeric$p_b,
+                       plist_numeric$p_mc,
+                       plist_numeric$p_mi,
+                       plist_numeric$p_mnc,
+                       plist_numeric$p_nk16,
+                       plist_numeric$p_nk56,
+                       plist_numeric$p_nkt,
+                       plist_numeric$p_cd4,
+                       plist_numeric$p_cd8,
+                       plist_numeric$p_neut,
+                       plist_numeric$p_eosin,
+                       plist_numeric$p_baso,
+                       plist_numeric$p_rbc,
+                       plist_numeric$p_platelet)
+  
+  graphs_interest <- list(blank, 
+                          plist_numeric$p_hamd17,
+                          plist_numeric$p_bdi,
+                          plist_numeric$p_chald,
+                          plist_numeric$p_shaps,
+                          plist_numeric$p_stai_t,
+                          plist_numeric$p_stai_s,
+                          plist_numeric$p_failed75,
+                          plist_numeric$p_ctq,
+                          plist_numeric$p_leq_z,
+                          plist_numeric$p_crp,
+                          plist_numeric$p_il6)
+  
+  graphs_figure <- list(plist_numeric$p_hamd17,
+                        plist_numeric$p_bdi,
+                        plist_numeric$p_chald,
+                        plist_numeric$p_shaps,
+                        plist_numeric$p_stai_t,
+                        plist_numeric$p_stai_s,
+                        plist_numeric$p_ctq,
+                        plist_numeric$p_leq_z,
+                        plist_numeric$p_failed75,
+                        plist_numeric$p_bmi,
+                        plist_numeric$p_age,
+                        plist_numeric$p_crp,
+                        plist_numeric$p_il6,
+                        plist_numeric$p_triglycerides)
+  
+  graphs_confound <- list(plist_numeric$p_bmi,
+                          plist_numeric$p_age,
+                          p_centre + guides(fill=FALSE),
+                          p_sex,p_infec,p_inflamm,p_tobacco,
+                          p_alcohol,p_cannabis,p_propAD)
+  
+  g <- cowplot::plot_grid(plotlist=graphs_input,nrow=2, align = "h")   
+  cowplot::save_plot(filename =  paste("apollo_clustering_input_",suffix,".pdf",sep=""), g, path=picpath, base_width=12, base_height=5)
+  g <- cowplot::plot_grid(plotlist=graphs_immuno,nrow=1, align = "h")   
+  cowplot::save_plot(filename =  paste("apollo_clustering_immuno_",suffix,".pdf",sep=""), g, path=picpath, base_width=4.5, base_height=3)
+  g <- cowplot::plot_grid(plotlist=graphs_confound,nrow=2, align = "h")   
+  cowplot::save_plot(filename =  paste("apollo_clustering_counfound_",suffix,".pdf",sep=""), g, path=picpath, base_width=9, base_height=6)
+  g <- cowplot::plot_grid(plotlist=graphs_figure,ncol=6, align = "hv")   
+  cowplot::save_plot(filename =  paste("apollo_clustering_numeric_",suffix,".pdf",sep=""), g, path=picpath, base_width=10, base_height=8)
+  
+}
+
+```
+
+Function for confounds plot by cluster membership
+```{r}
+make_mini_confounds_plot <- function(data=m, basedir=here::here("res/"), picpath=here::here("pics/"), reg=NULL, cols=clustercols, suffix=""){
+  
+  vjust <- 0.5
+  step_increase <- 0.12
+
+  p_sex <- ggplot(data=data, aes(cluster_id, fill = sex, label=..count..)) + geom_bar(position = "fill") + 
+    scale_y_continuous(labels = scales::percent) + xlab("") + ylab("") + 
+    ggtitle("Sex") + scale_fill_manual(values=cols) + 
+    theme_bw() + 
+    geom_text(stat="count",position="fill",vjust=1) + theme(legend.title = element_blank())
+
+  p_centre <- ggplot(data=data, aes(fill=macs_flow_centre, x = cluster_id, label=..count..)) + geom_bar(position = "fill") + 
+    scale_y_continuous(labels = scales::percent) +
+    ggtitle("Clinical\ncentre") + 
+    theme_bw() + xlab("") + ylab("") +
+    ggtitle("Study centre") + expand_limits(y=0) + 
+    geom_text(stat="count",position="fill",vjust=1) + theme(legend.title = element_blank())
+  
+  p_infec <- ggplot(data=data[!is.na(data$infections),], aes(fill=droplevels(infections), x = cluster_id, label=..count..)) + geom_bar(position = "fill") + 
+    scale_y_continuous(labels = scales::percent) + xlab("") + ylab("") + 
+    ggtitle("Recent\ninfection") + scale_fill_manual(values=cols) + 
+    theme_bw() +
+    geom_text(stat="count",position="fill",vjust=1) + theme(legend.title = element_blank())
+  
+  p_inflamm <- ggplot(data=data[!is.na(data$lynall_inflamm_yn),], aes(fill=droplevels(lynall_inflamm_yn), x = cluster_id, label=..count..)) + geom_bar(position = "fill") + 
+    scale_y_continuous(labels = scales::percent) + xlab("") + ylab("") + 
+    ggtitle("Minor\ninflammatory\ndisease") + scale_fill_manual(values=cols) + 
+    theme_bw() + 
+    geom_text(stat="count",position="fill",vjust=1) + theme(legend.title = element_blank())
+
+  p_tobacco <- ggplot(data=data[!is.na(data$tobacco_yn),], aes(fill=tobacco_yn, x = cluster_id, label=..count..)) + geom_bar(position = "fill") + 
+    scale_y_continuous(labels = scales::percent) + xlab("") + ylab("") + 
+    ggtitle("Current\ntobacco use") + scale_fill_manual(values=cols) + 
+    theme_bw() + 
+    geom_text(stat="count",position="fill",vjust=1) + theme(legend.title = element_blank())
+  
+  p_alcohol <- ggplot(data=data[!is.na(data$alcohol_yn),], aes(fill=alcohol_yn, x = cluster_id, label=..count..)) + geom_bar(position = "fill") + 
+    scale_y_continuous(labels = scales::percent) + xlab("") + ylab("") + 
+    ggtitle("Current\nalcohol use") + scale_fill_manual(values=cols) +  
+    theme_bw() + 
+    geom_text(stat="count",position="fill",vjust=1) + theme(legend.title = element_blank())
+  
+  p_cannabis <- ggplot(data=data[!is.na(data$cannabis_yn),], aes(fill=cannabis_yn, x = cluster_id, label=..count..)) + geom_bar(position = "fill") + 
+    scale_y_continuous(labels = scales::percent) + xlab("") + ylab("") + 
+    ggtitle("Current\ncannabis use") + scale_fill_manual(values=cols) + 
+    theme_bw() + 
+    geom_text(stat="count",position="fill",vjust=1) + theme(legend.title = element_blank())
+
+  # % unemployed
+  p_unemployed <- ggplot(data=data[!is.na(data$unemployed_yn),], aes(fill=unemployed_yn, x = cluster_id, label=..count..)) + geom_bar(position = "fill") + 
+    scale_y_continuous(labels = scales::percent) + xlab("") + ylab("") + 
+    ggtitle("Unemployed") + scale_fill_manual(values=cols) + 
+    theme_bw() + 
+    geom_text(stat="count",position="fill",vjust=1) + theme(legend.title = element_blank())
+  
+  p_propAD <- ggplot(data=data[!is.na(data$current_antidepress_yn),], aes(fill=current_antidepress_yn, x = cluster_id, label=..count..)) + geom_bar(position = "fill") + 
+    scale_y_continuous(labels = scales::percent) + xlab("") + ylab("") + 
+    ggtitle("Current anti-\ndepressant\ntreatment") + scale_fill_manual(values=cols) + 
+    theme_bw() + 
+    geom_text(stat="count",position="fill",vjust=1) + theme(legend.title = element_blank())
+  
+  graphs_confound <- list(p_sex,p_infec,p_inflamm,p_tobacco, p_centre, p_alcohol,p_cannabis,p_propAD,p_unemployed)
+  
+  if (length(unique(data$cluster_id)) >3){
+    g <- cowplot::plot_grid(plotlist=graphs_confound,nrow=2, align = "h")   
+    cowplot::save_plot(filename =  paste("apollo_mini_confounds_",reg,suffix,".pdf",sep=""), g, path=picpath, base_width=11.9, base_height=5.5)
+  } else { # less wide if only 2 clusters
+    g <- cowplot::plot_grid(plotlist=graphs_confound,nrow=2, align = "h")   
+    cowplot::save_plot(filename =  paste("apollo_mini_confounds_",reg,suffix,".pdf",sep=""), g, path=picpath, base_width=11, base_height=5.5)
+  }
+}
+
+```
+
+
+Make the cluster plots
+```{r}
+
+clustercols <- c("dark grey","orange","dodgerblue2","red")
+
+mdd$cluster_id <- mdd$meta_subsample
+levels <- levels(mdd$cluster_id)
+
+make_4_cluster_plot(data=mdd,basedir=here::here("res/"), picpath=here::here("pics/"),cluster_fx=choice_qset, cols=clustercols, levels=levels,suffix="_subsample")
+
+make_mini_confounds_plot(data=mdd, basedir=here::here("res/"),picpath=here::here("pics/"), reg=NULL, cols=c("grey","red"), suffix="_subsample")
+
+```
+
+Now radar plot:
+```{r}
+library(scales)
+postsc <- mdd %>% dplyr::group_by(meta_subsample) %>% dplyr::summarise_at(vars(one_of(choice_qset)),median) %>%
+     mutate_at(vars(one_of(choice_qset)),rescale)
+
+library(ggradar)
+# Make radar plot for significantly different clusters only [manually drop NK56 and RBCs which were not significantly different between groups]
+p <- ggradar(select(postsc,-one_of(c("q_nk56","q_rbc"))), axis.labels=labels_qset[!names(labels_qset) %in% c("q_nk56","q_rbc")], axis.label.size=8, label.centre.y = FALSE, label.gridline.min = FALSE, label.gridline.mid = FALSE, label.gridline.max = FALSE, legend.text.size = 8, legend.title = "Cluster", font.radar="Helvetica") + scale_color_manual(values=clustercols) + theme(legend.position = "none")  + 
+    scale_x_continuous(expand = c(0.2, 0.2))
+ggsave(p,file=paste(here::here("pics/"),"apollo_mclust_mdd_radar_postsc_resample_dropnonsig.eps",sep=""), width=10,height=8)
+
+```
+
+
+Now make legend
+```{r}
+
+p <- ggplot(mdd,aes(x=cluster_id,y=ham_17_score, fill=cluster_id)) + geom_violin() + scale_fill_manual(values=clustercols, labels=c("Cluster 0, n=58","Cluster 1, n=10","Cluster 2, n=100","Cluster 3, n=38")) + theme(legend.title = element_blank())
+
+get_legend<-function(myggplot){
+  tmp <- ggplot_gtable(ggplot_build(myggplot))
+  leg <- which(sapply(tmp$grobs, function(x) x$name) == "guide-box")
+  legend <- tmp$grobs[[leg]]
+  return(legend)
+}
+library(cowplot)
+p <- ggdraw() + draw_plot(get_legend(p)) 
+ggsave(p, file=paste(here::here("pics/"),"apollo_cluster_legend_mdd_noreg_subsample.pdf",sep=""))
+```
+
+Show results on PCA
+```{r}
+tmp <- mdd[,choice_qset]
+colnames(tmp) <- labels_qset
+pca.out <- prcomp(tmp,center=T,scale=T)
+
+# Flip PCA1 axis
+pca.out$rotation[,1] %<>% "*"(-1)
+pca.out$x[,1] %<>% "*"(-1)
+
+library(ggfortify)
+library(ggrepel)
+autoplot(pca.out, data=mdd, colour='meta_subsample', label=FALSE, loadings=FALSE, loadings.label=FALSE, loadings.label.size=4, loadings.label.hjust=-0.1, loadings.label.repel=FALSE, frame = TRUE, frame.type="convex", frame.colour = 'meta_subsample') + scale_color_manual(values = clustercols) + scale_fill_manual(values=clustercols)+ theme_bw() + theme(legend.position = c(0.89,0.87),legend.background = element_rect(color = "black"), legend.title = element_blank()) + coord_equal() 
+ggsave(filename = paste(here::here("pics/"),"apollo_pca_with_meta_subsample_mdd.pdf"), width=7,height=5)
+
+library(reshape2)
+eigen <- data.frame(pca.out$rotation[,1:2])
+colnames(eigen) = c("PC1","PC2")
+eigen$count <- rownames(eigen)
+
+# New sorting order
+desired_order <- rev(c("Neutrophils","Eosinophils","Basophils","Mono (non-class)","Mono (int)","Mono (classical)", "CD4+ T" ,"CD8+ T" ,"CD16(hi) NK","CD56(hi) NK","NKT cells","B cells" ,"RBCs","Platelets"))            
+
+# Re-order the levels
+eigen$count <- factor( as.character(eigen$count), levels=desired_order )
+# Re-order the data.frame
+eigen <- eigen[order(eigen$count),]
+
+ggplot(melt(eigen, value.name="Eigenvector"),aes(x=count,y=Eigenvector, fill=variable)) + geom_bar(stat="identity") + coord_flip() + scale_x_discrete(labels=labels_qset) + facet_grid(~variable, scales="free") + xlab("") + scale_fill_discrete(name = "Component") + ylab("") + guides(fill=FALSE) + theme_bw()
+ggsave(file=paste(here::here("pics/"),"apollo_mdd_pca_pca1and2.pdf",sep=""),width=3.8,height=3.2)
+```
+
+Supplementary material - MDD typicality (cf Penninx papers) and cluster
+```{r}
+p_appetite <- ggplot(data=subset(mdd, !is.na(as.factor(becks_q18))), aes(cluster_id, fill = as.factor(becks_q18), label=..count..)) + 
+    geom_bar(position = "fill") + 
+    scale_y_continuous(labels = scales::percent) + 
+    xlab("") + ylab("") +
+    ggtitle("BDI Appetite") + 
+    scale_fill_manual(breaks=c("0","1","2","3"),values=c("grey","red","dark red","gray2"), labels=c("no worse (0)","not as good (1)","much worse (2)","none at all (3)")) + theme_bw() +
+  theme(legend.title = element_blank()) 
+p_appetite
+
+p_weightloss <- ggplot(data=subset(mdd, !is.na(as.factor(becks_q19))), aes(cluster_id, fill = as.factor(becks_q19), label=..count..)) + 
+    geom_bar(position = "fill") + 
+    scale_y_continuous(labels = scales::percent) + 
+    xlab("") + ylab("") +
+    ggtitle("BDI Weight loss") + 
+    scale_fill_manual(breaks=c("0","1","2","3"),values=c("grey","red","dark red","gray2"), labels=c("<5 pounds (0)",">5 pounds (1)",">10 pounds (2)",">15 pounds (3)")) + theme_bw() +
+  theme(legend.title = element_blank()) 
+p_weightloss
+
+
+p_onset <- ggplot(data=subset(mdd, !is.na(ham_q4_early)), aes(cluster_id, fill = as.factor(ham_q4_early), label=..count..)) + 
+    geom_bar(position = "fill") + 
+    scale_y_continuous(labels = scales::percent) + 
+    xlab("") + ylab("") +
+    ggtitle("HAM-D onset insomnia") + 
+    scale_fill_manual(values=c("grey","red","dark red"), labels=c("absent (0)","occasional (1)","frequent (2)")) + theme_bw() +
+  theme(legend.title = element_blank()) 
+p_onset
+
+p_middle <- ggplot(data=subset(mdd, !is.na(ham_q5_middle)), aes(cluster_id, fill = as.factor(ham_q5_middle), label=..count..)) + 
+    geom_bar(position = "fill") + 
+    scale_y_continuous(labels = scales::percent) + 
+    xlab("") + ylab("") +
+    ggtitle("HAM-D middle insomnia") + 
+    scale_fill_manual(values=c("grey","red","dark red"), labels=c("absent (0)","occasional (1)","frequent (2)")) + theme_bw() +
+  theme(legend.title = element_blank()) 
+p_middle
+
+
+p_emw <- ggplot(data=subset(mdd, !is.na(ham_q6_late)), aes(cluster_id, fill = as.factor(ham_q6_late), label=..count..)) + 
+    geom_bar(position = "fill") + 
+    scale_y_continuous(labels = scales::percent) + 
+    xlab("") + ylab("") +
+    ggtitle("HAM-D Early morning wakening") + 
+    scale_fill_manual(values=c("grey","red","dark red"), labels=c("absent (0)","occasional (1)","frequent (2)")) + theme_bw() +
+  theme(legend.title = element_blank()) 
+p_emw
+
+p_suicidality <- ggplot(data=subset(mdd, !is.na(ham_q3_suicidality)), aes(cluster_id, fill = as.factor(ham_q3_suicidality), label=..count..)) + 
+    geom_bar(position = "fill") + 
+    scale_y_continuous(labels = scales::percent) + 
+    xlab("") + ylab("") +
+    ggtitle("HAM-D suicidality") + 
+    scale_fill_manual(values=c("grey","red","dark red","gray2","salmon"), labels=c("none (0)","life not worth living (1)","wish to be dead (2)","suicidal ideas/gestures (3)","suicide attempts (4)")) + theme_bw() +
+  theme(legend.title = element_blank()) 
+p_suicidality 
+
+g <- cowplot::plot_grid(p_appetite, p_weightloss, p_onset, p_middle, p_emw, p_suicidality,rel_heights = c(1,1), rel_widths = c(1,1), align = "hv")
+ggsave(g, file=paste(here::here("pics/"),"apollo_mdd_by_metacluster_penninx.pdf",sep=""),width=11,height=4.5)
+```
+
+
+Now stats on the 6 variables - none are significant
+```{r}
+kruskal.test(becks_q18 ~ cluster_id, data=mdd) # p=0.3
+kruskal.test(becks_q19 ~ cluster_id, data=mdd) # p=0.4
+kruskal.test(ham_q3_suicidality ~ cluster_id, data=mdd) # p=0.5
+kruskal.test(ham_q4_early ~ cluster_id, data=mdd) # p=0.5
+kruskal.test(ham_q5_middle ~ cluster_id, data=mdd) # p=0.2
+kruskal.test(ham_q6_late ~ cluster_id, data=mdd) # p=0.7
+
+```
+
+Per-cluster statistics (supplementary info)
+```{r}
+
+yin <- c("age_at_bloods","crp_macs","p_il_6_mean","ham_17_score","bdi_total_score","chalder_fatigue_score","shaps_score_calc","s_anxiety_score","t_anxiety_score","ctq_total_score","leq_z","antidepress_failed_75_less","bmi_calculated", "thyroid_stim_hormone","triglycerides")
+
+tmp <- mdd %>% group_by(cluster_id) %>% select(cluster_id,yin) %>% summarize_all(.vars=yin,funs(median=median(.,na.rm=TRUE))) %>% t %>% as.data.frame %>% .[-1,]
+colnames(tmp) <- c("Cluster 0","Cluster 1","Cluster 2","Cluster 3")
+
+pees <- mdd %>% summarise_at(vars(yin),~PMCMRplus::kruskalTest(.x ~ .y)$p.value,.$cluster_id) %>% signif(3) %>% t %>% as.data.frame 
+colnames(pees) <- "pval_kw"
+
+tmp2 <- cbind(tmp,pees)
+tmp2$variable <- rownames(tmp2)
+tmp2 %<>% select(variable, everything())
+tmp2
+
+write.table(tmp2, file=paste(here::here("res/"),"apollo_mdd_cluster_characteristics_numeric_meta_subsample.txt",sep=""),sep="\t", dec=".",quote=FALSE, row.names = FALSE)
+
+```
+
+Set up table of categorical variables
+```{r}
+tmp <- data.frame(matrix(ncol = 0, nrow = 4))
+mdd$cluster_id <- mdd$meta_subsample 
+
+# Drop NAs and get percentages
+tmp$perc_female <- mdd %>% count(cluster_id,sex) %>% na.omit %>% group_by(cluster_id) %>% mutate(perc = 100*n / sum(n)) %>% filter(sex=="female") %>% ungroup %>% pull(perc) %>% round(3)
+
+tmp$perc_antidepress <- mdd %>% count(cluster_id,current_antidepress_yn) %>% na.omit %>% group_by(cluster_id) %>% mutate(perc = 100*n / sum(n)) %>% filter(current_antidepress_yn=="yes") %>% ungroup %>% pull(perc) %>% round(3)
+
+tmp$perc_tobacco <- mdd %>% count(cluster_id,tobacco_yn) %>% na.omit %>% group_by(cluster_id) %>% mutate(perc = 100*n / sum(n)) %>% filter(tobacco_yn=="yes") %>% ungroup %>% pull(perc) %>% round(3)
+
+tmp$perc_alcohol <- mdd %>% count(cluster_id,alcohol_yn) %>% na.omit %>% group_by(cluster_id) %>% mutate(perc = 100*n / sum(n)) %>% filter(alcohol_yn=="yes") %>% ungroup %>% pull(perc) %>% round(3)
+
+library(tidyr) 
+tmp$perc_cannabis <- mdd %>% count(cluster_id,cannabis_yn) %>% na.omit %>%  complete(cluster_id,cannabis_yn,fill=list(n=0)) %>% group_by(cluster_id) %>% mutate(perc = 100*n / sum(n)) %>% filter(cannabis_yn=="yes") %>% ungroup %>% pull(perc) %>% round(3) 
+
+tmp$perc_unemployed <- mdd %>% count(cluster_id,unemployed_yn) %>% na.omit %>% group_by(cluster_id) %>% mutate(perc = 100*n / sum(n)) %>% filter(unemployed_yn=="yes") %>% ungroup %>% pull(perc) %>% round(3)
+
+tmp$perc_infection <- mdd %>% count(cluster_id,infections) %>% na.omit %>% group_by(cluster_id) %>% mutate(perc = 100*n / sum(n)) %>% filter(infections=="yes") %>% ungroup %>% pull(perc) %>% round(3)
+
+tmp$perc_inflammatory <- mdd %>% count(cluster_id,lynall_inflamm_yn) %>% na.omit %>% group_by(cluster_id) %>% mutate(perc = 100*n / sum(n)) %>% filter(lynall_inflamm_yn=="yes") %>% ungroup %>% pull(perc) %>% round(3)
+
+tmp$centre <- rep(NA,4)
+
+tmp <- tmp %>% t %>% as.data.frame
+
+colnames(tmp) <- c("Cluster 0","Cluster 1","Cluster 2","Cluster 3")
+
+```
+
+Function for chi2 post-hoc testing
+This is a modified version of NCStats::chisqPostHoc allowing simulate.p.value=TRUE
+```{r}
+chi_post_hoc <- function (chi, popsInRows = TRUE, control = stats::p.adjust.methods, 
+          digits = 4, verbose = TRUE, simulate.p.value=FALSE) 
+{
+  control <- match.arg(control)
+  tbl <- chi$observed
+  if (!popsInRows) 
+    tbl <- t(tbl)
+  popsNames <- rownames(tbl)
+  if (is.null(popsNames)) 
+    popsNames <- 1:ncol(tbl)
+  prs <- utils::combn(1:nrow(tbl), 2)
+  tests <- ncol(prs)
+  pvals <- numeric(tests)
+  lbls <- character(tests)
+  for (i in 1:tests) {
+    tmp <- tbl[prs[, i], ]
+    csums <- colSums(tmp) == 0
+    if (any(csums)) 
+      tmp <- tmp[, !csums]
+    if (!is.matrix(tmp)) {
+      pvals[i] <- NA
+    }
+    else {
+      if (!verbose) 
+        options(warn = -1)
+      pvals[i] <- stats::chisq.test(tmp,simulate.p.value = simulate.p.value)$p.value
+      if (!verbose) 
+        options(warn = 0)
+    }
+    lbls[i] <- paste(popsNames[prs[, i]], collapse = " vs. ")
+  }
+  adj.pvals <- stats::p.adjust(pvals, method = control)
+  cat("Adjusted p-values used the", control, "method.\n\n")
+  data.frame(comparison = lbls, raw.p = round(pvals, digits), 
+             adj.p = round(adj.pvals, digits))
+}
+```
+
+Now chi testing for categorical variables.
+```{r}
+set.seed(111) # as using simulation
+tmp$pval_chi2 <- rep(NA)
+
+# Stats for each categorical variable
+chi <- chisq.test(t(table(mdd$sex, mdd$cluster_id)), simulate.p.value=TRUE)
+print("sex")
+print(chi) # 1
+chi_post_hoc(chi,popsInRows =TRUE,control="BH",simulate.p.value = TRUE) 
+tmp["perc_female","pval_chi2"] <- chi$p.value %>% signif(3)
+
+chi <- chisq.test(t(table(mdd$tobacco_yn, mdd$cluster_id)), simulate.p.value=TRUE)
+print("tobacco")
+print(chi) # 0.1
+chi_post_hoc(chi,popsInRows =TRUE,control="BH",simulate.p.value = TRUE)
+tmp["perc_tobacco","pval_chi2"] <- chi$p.value %>% signif(3)
+
+chi <- chisq.test(t(table(mdd$alcohol_yn, mdd$cluster_id)), simulate.p.value=TRUE)
+print("alcohol")
+chi # 0.6
+chi_post_hoc(chi,popsInRows =TRUE,control="BH",simulate.p.value = TRUE)
+tmp["perc_alcohol","pval_chi2"] <- chi$p.value %>% signif(3)
+
+chi <- chisq.test(t(table(mdd$cannabis_yn, mdd$cluster_id)), simulate.p.value=TRUE)
+print("cannabis")
+chi # 0.4
+chi_post_hoc(chi,popsInRows =TRUE,control="BH",simulate.p.value = TRUE)
+tmp["perc_cannabis","pval_chi2"] <- chi$p.value %>% signif(3)
+
+chi <- chisq.test(t(table(mdd$unemployed_yn, mdd$cluster_id)), simulate.p.value=TRUE)
+print("unemployed")
+chi # 0.004
+chi_post_hoc(chi,popsInRows =TRUE,control="BH",simulate.p.value = TRUE) # Interesting, only sig is C0 vs C1
+#  comparison  raw.p  adj.p
+#1  C0 vs. C1 0.0010 0.0060 IN PAPER
+
+tmp["perc_unemployed","pval_chi2"] <- chi$p.value %>% signif(3)
+
+chi <- chisq.test(t(table(mdd$current_antidepress_yn, mdd$cluster_id)), simulate.p.value=TRUE) 
+print("current antidepressant")
+chi # 0.3
+chi_post_hoc(chi,popsInRows =TRUE,control="BH",simulate.p.value = TRUE)
+tmp["perc_antidepress","pval_chi2"] <- chi$p.value %>% signif(3)
+
+chi <- chisq.test(t(table(mdd$macs_flow_centre, mdd$cluster_id)), simulate.p.value=TRUE)
+print("centre")
+print(chi) # 0.04
+chi_post_hoc(chi,popsInRows =TRUE,control="BH",simulate.p.value = TRUE)
+tmp["centre","pval_chi2"] <- chi$p.value %>% signif(3) # C1 vs C3 are significant
+#  comparison  raw.p  adj.p
+#5  C1 vs. C3 0.004 0.02
+
+chi <- chisq.test(t(table(mdd$infections, mdd$cluster_id)), simulate.p.value=TRUE)
+print("infections")
+chi # 0.2
+chi_post_hoc(chi,popsInRows =TRUE,control="BH",simulate.p.value = TRUE)
+tmp["perc_infection","pval_chi2"] <- chi$p.value %>% signif(3) #
+
+chi <- chisq.test(t(table(mdd$lynall_inflamm_yn, mdd$cluster_id)), simulate.p.value=TRUE)
+print("inflammatory")
+chi # 0.7
+chi_post_hoc(chi,popsInRows =TRUE,control="BH",simulate.p.value = TRUE)
+tmp["perc_inflammatory","pval_chi2"] <- chi$p.value %>% signif(3) 
+
+tmp$variable <- rownames(tmp)
+tmp %<>% select(variable, everything())
+tmp
+
+write.table(tmp, file=paste(here::here("res/"),"apollo_mdd_cluster_characteristics_categorical_meta_subsample.txt",sep=""),sep="\t", dec=".",quote=FALSE, row.names = FALSE)
+
+# n per group
+table(mdd$cluster_id)
+
+```
+
+```{r}
+sessionInfo()
+```
+
+Feb 2019:
+R version 3.5.2 (2018-12-20)
+Platform: x86_64-apple-darwin15.6.0 (64-bit)
+Running under: macOS Mojave 10.14
+
+Matrix products: default
+BLAS: /System/Library/Frameworks/Accelerate.framework/Versions/A/Frameworks/vecLib.framework/Versions/A/libBLAS.dylib
+LAPACK: /Library/Frameworks/R.framework/Versions/3.5/Resources/lib/libRlapack.dylib
+
+locale:
+[1] en_GB.UTF-8/en_GB.UTF-8/en_GB.UTF-8/C/en_GB.UTF-8/en_GB.UTF-8
+
+attached base packages:
+[1] stats     graphics  grDevices utils     datasets  methods   base     
+
+other attached packages:
+ [1] tidyr_0.8.2     reshape2_1.4.3  ggrepel_0.8.0   ggfortify_0.4.5
+ [5] Rtsne_0.15      cowplot_0.9.4   ggradar_0.1     scales_1.0.0   
+ [9] ggplot2_3.1.0   ggsignif_0.4.0  clue_0.3-56     here_0.1       
+[13] dplyr_0.8.0.1   magrittr_1.5    mclust_5.4     
+
+loaded via a namespace (and not attached):
+ [1] PMCMRplus_1.4.1    tidyselect_0.2.5   xfun_0.4          
+ [4] purrr_0.3.0        colorspace_1.4-0   yaml_2.2.0        
+ [7] gmp_0.5-13.2       utf8_1.1.4         rlang_0.3.1       
+[10] pillar_1.3.1.9000  glue_1.3.0         Rmpfr_0.7-2       
+[13] withr_2.1.2        plyr_1.8.4         multcompView_0.1-7
+[16] stringr_1.4.0      munsell_0.5.0      gtable_0.2.0      
+[19] mvtnorm_1.0-8      memoise_1.1.0      labeling_0.3      
+[22] knitr_1.21         forcats_0.4.0      fansi_0.4.0       
+[25] Rcpp_1.0.0         backports_1.1.3    kSamples_1.2-8    
+[28] gridExtra_2.3      TeachingDemos_2.10 digest_0.6.18     
+[31] stringi_1.3.1      BWStest_0.2.2      SuppDists_1.1-9.4 
+[34] grid_3.5.2         rprojroot_1.3-2    cli_1.0.1         
+[37] tools_3.5.2        lazyeval_0.2.1     FSA_0.8.22        
+[40] tibble_2.0.1       cluster_2.0.7-1    crayon_1.3.4      
+[43] NCStats_0.4.6.9000 pkgconfig_2.0.2    MASS_7.3-51.1     
+[46] assertthat_0.2.0   rstudioapi_0.9.0   R6_2.4.0          
+[49] compiler_3.5.2    

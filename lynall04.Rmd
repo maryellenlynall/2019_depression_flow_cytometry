@@ -1,0 +1,245 @@
+---
+title: "lynall04"
+output: html_document
+---
+
+## Contents:
+- Univariate testing of cell counts by case-control status (Table S3)
+- Figure 1A plots
+- Table 1 data
+- Correlation plots in Figures 1B and Figure S3
+
+```{r}
+library(ggplot2)
+library(dplyr)
+library(ggsignif)
+library(tidyr)
+library(here)
+library(magrittr) 
+library(reshape2)
+
+load(file=paste(here::here("res/"),"Apollo_qm_combi.Rdata",sep=""))
+
+# abs names
+choice_qset <- c("q_rbc","q_platelet","q_baso","q_eosin","q_neut","q_mono_class","q_mono_int","q_mono_nonclass","q_cd4","q_cd8","q_b","q_nkt","q_nk16","q_nk56")
+labels_qset <- c(q_rbc="RBCs",q_platelet="Platelets",q_baso="Basophils",q_eosin="Eosinophils",q_neut="Neutrophils",q_mono_class="Mono (classical)",q_mono_int="Mono (int)",q_mono_nonclass="Mono (non-class)",q_cd4="CD4+ T",q_cd8="CD8+ T",q_b="B cells",q_nkt="NKT cells",q_nk16="CD16(hi) NK",q_nk56="CD56(hi) NK")
+
+# Longer names
+labels_qset_long <- labels_qset
+labels_qset_long["q_mono_int"] <- "Intermediate\nmonocytes"
+labels_qset_long["q_mono_class"] <- "Classical\nmonocytes"
+labels_qset_long["q_mono_nonclass"] <- "Non-classical\nmonocytes"
+
+# Humoral proteins
+labels_humor <- c(crp_macs="CRP",p_il_6_mean="Plasma IL-6")
+```
+
+FIGURE 1A (counts AND CRP, IL-6, colored by significance in illustrator post-plotting)
+```{r}
+
+# Counts
+m_sub <- reshape2::melt(qm_combi[,c("name","disorder",choice_qset)], id.vars=c("name","disorder")) 
+ggplot(m_sub, aes(x=droplevels(disorder),y=value, fill=disorder)) + xlab("Cell type") + ylab("Absolute count / microlitre") + ggtitle("") + geom_violin(adjust=2) + scale_fill_manual(values = c("dark grey","blue")) + geom_boxplot(width=0.3,outlier.shape = NA,fill="white") + facet_wrap(~variable, scales="free_y", nrow=2, labeller=labeller(variable=c(labels_qset_long)))  + xlab("") + theme(axis.ticks.x=element_blank(),axis.text.x=element_blank()) + theme_bw() + guides(fill=FALSE)   
+ggsave(path=here::here("pics/"), filename="apollo_fig1a_all_by_disorder_LHS.pdf", width=9.2,height=5) 
+
+# CRP and IL-6
+m_sub <- reshape2::melt(qm_combi[,c("name","disorder","crp_macs","p_il_6_mean")], id.vars=c("name","disorder")) 
+ggplot(m_sub, aes(x=droplevels(disorder),y=value, fill=disorder)) + xlab("Cell type") + ylab("") + ggtitle("") + geom_violin(adjust=2) + scale_fill_manual(values = c("dark grey","blue")) + geom_boxplot(width=0.3,outlier.shape = NA,fill="white") + facet_wrap(~variable, scales="free_y", nrow=2, labeller=labeller(variable=labels_humor)) + xlab("") + theme(axis.ticks.x=element_blank(),axis.text.x=element_blank()) + theme_bw() + guides(fill=FALSE) + scale_y_log10()
+ggsave(path=here::here("pics/"), filename="apollo_fig1a_all_by_disorder_RHS.pdf", width=1.65,height=5) 
+```
+
+Function for wilcox test including effect size
+```{r}
+
+mel_wilcox <- function(formula, data=NULL){
+  require(coin)
+  w2 <- coin::wilcox_test(formula,data=data, distribution="exact", conf.int=TRUE)
+  out <- c()
+  out$n <- length(w2@statistic@block)
+  out$y <- table(w2@statistic@x)
+  out$formula <- formula
+  out$estimate <- confint(w2)$estimate
+  out$effect.size <- statistic(w2) / sqrt ( out$n )
+  out$p.value <- coin::pvalue(w2)
+  return(out) 
+}  
+
+```
+
+Table of clinical features
+```{r}
+library(qwraps2) # for median IQR
+
+options(scipen=2)
+
+# Categorical variables
+cats <-  c("disorder","sex", "unemployed_yn","tobacco_yn", "alcohol_yn", "cannabis_yn", "current_antidepress_yn")
+for (i in 1:length(cats)){
+  var <- cats[i]
+  print(var)
+print(qm_combi %>% 
+  group_by(disorder, get(var)) %>%
+  filter(!is.na(get(var))) %>%
+  summarise (n = n()) %>%
+  mutate(perc = n / sum(n)*100)) 
+cat("\n\n")
+}
+
+set.seed(111)
+print("P values for chisq.test with simulated p values")
+results <- data.frame(p.value=as.numeric(), chi=as.numeric())
+
+# Case-control differences (not applicable for current antidepressant usage)
+for (i in 2:length(cats)){
+  df <- qm_combi %>% select(disorder,cats[i])
+  colnames(df) <- c("x","y")
+  out <- chisq.test(table(df),simulate.p.value = TRUE)
+  results[i-1,"p.value"] <- out$p.value
+  results[i-1,"chi"] <- out$statistic
+}
+rownames(results) <- cats[2:length(cats)]
+results$missing <- qm_combi %>% select(cats) %>% summarise_at(vars(-one_of(c("disorder"))),function(x){sum(is.na(x))}) %>% t
+print(results)
+```
+
+Table: continuous variables
+```{r}
+
+cont <- qm_combi %>% select(disorder, age_at_bloods,bmi_calculated,ham_17_score, bdi_total_score, chalder_fatigue_score, shaps_score_calc,s_anxiety_score,t_anxiety_score, ctq_total_score, leq_z, antidepress_failed_75_less, thyroid_stim_hormone, triglycerides)
+
+# Medians
+tx <- as.data.frame(t(cont %>% group_by(disorder) %>% summarise_all(function(x){median_iqr(x,digits=1, na_rm=TRUE, show_n="never")})))
+tx %<>% .[-1,] 
+tx$p <- as.numeric("")
+tx$eff <- as.numeric("")
+
+for (i in 2:ncol(cont)){
+  df <- cont %>% select(disorder,i)
+  colnames(df) <- c("x","y")
+  out <- mel_wilcox(y~x,data=df)
+  tx$p[i-1] <- out$p.value # i-1 as first column was disorder
+  tx$eff[i-1] <- out$effect.size
+}
+
+tx$missing <- as.numeric("")
+tx$missing <- t(cont %>% summarise_at(vars(-one_of(c("disorder"))),~sum(is.na(.x)))) 
+
+tx$variable <- rownames(tx)
+tx %<>% select(variable, everything())
+tx
+
+write.table(tx,file=paste(here::here("res/"),"apollo_table_qm_combi_continuous.csv",sep=""),sep="\t", dec=".",quote=FALSE, row.names = FALSE)
+
+```
+
+
+Table of median counts in MDD vs. control
+```{r}
+
+cont <- qm_combi %>% select(disorder, "crp_macs", "p_il_6_mean", choice_qset)
+
+tx <- as.data.frame(t(cont %>% group_by(disorder) %>% summarise_all(function(x){median_iqr(x,digits=3, na_rm=TRUE, show_n="never")})))
+tx %<>% .[-1,] 
+tx$p <- as.numeric("")
+tx$eff <- as.numeric("")
+for (i in 2:ncol(cont)){
+  df <- cont %>% select(disorder,i)
+  colnames(df) <- c("x","y")
+  out <- mel_wilcox(y~x,data=df)
+  tx$p[i-1] <- out$p.value # i-1 as first column was idsorder
+  tx$eff[i-1] <- out$effect.size
+}
+
+rownames(tx) <- c("CRP","IL-6",labels_qset)
+
+tx$missing <- as.numeric("")
+tx$missing <- t(cont %>% summarise_at(vars(-one_of(c("disorder"))),~sum(is.na(.x)))) 
+
+tx$variable <- rownames(tx)
+tx %<>% select(variable, everything())
+tx
+
+write.table(tx,file=paste(here::here("res/"),"apollo_table_choice_qset_continuous.csv",sep=""),sep="\t", dec=".", quote=FALSE, row.names = FALSE)
+
+```
+
+
+Output median counts. Note that RBCs are given at x 10^12 per L i.e. 10^6 per uL. White cells and platelets are given at x10^9 per L i.e 10^3 per uL. 
+```{r}
+cat(choice_qset, file = paste(here::here("res/"),"apollo_median_absolute_counts.txt",sep=""))
+cat("\n", file = paste(here::here("res/"),"apollo_median_absolute_counts.txt",sep=""), append = TRUE)
+cat(apply(qm_combi[,choice_qset],2,median), file = paste(here::here("res/"),"apollo_median_absolute_counts.txt",sep=""), append=TRUE)
+```
+
+
+Figure 1B correlation plot
+```{r}
+library(ggcorrplot)
+library(Hmisc)
+# Choose variables to go with qset
+yin <- c("ham_17_score","bdi_total_score","shaps_score_calc","chalder_fatigue_score","ctq_total_score","leq_z","s_anxiety_score","t_anxiety_score")
+labels_yin <- c("Depression (HAM-D)","Depression (BDI)","Anhedonia (SHAPS)","Chalder fatigue","Childhood trauma (CTQ)","Recent stress (LEQ)", "Stait anxiety (STAI-S)","Trait anxiety (STAI-T)")
+names(labels_yin) <- yin
+
+forcor <- qm_combi[,c(choice_qset,"crp_macs","p_il_6_mean",yin,"age_at_bloods","bmi_calculated")]
+labels_cor <- c(labels_qset,labels_humor,labels_yin,"age_at_bloods"="age","bmi_calculated"="BMI")
+forcor %<>% plyr::rename(labels_cor)
+
+library(RColorBrewer)
+library(corrplot)
+
+scalebluered <- colorRampPalette(brewer.pal(8, "RdBu"))(8)
+tmp <- Hmisc::rcorr(data.matrix(forcor), type="spearman")
+
+# Adjust correlation p values
+praw <- gdata::lowerTriangle(tmp$P)
+length(praw) # Correcting for this many multiple comparisons (325)
+padjust <- p.adjust(praw, method="BH")
+
+tmp$Padj <- tmp$P
+gdata::lowerTriangle(tmp$Padj) <- padjust
+gdata::upperTriangle(tmp$Padj) = gdata::lowerTriangle(tmp$Padj, byrow=TRUE)
+
+corrplot::corrplot(tmp$r, method="shade", tl.pos="lt", type="full", tl.col="black", tl.cex=0.85, tl.srt=45, p.mat = tmp$Padj, sig.level=0.05, addgrid.col="grey", insig = "blank",cl.pos="n") + colorlegend(xlim=c(-10.8,-8.7), ylim=c(13.5,17.5), scalebluered, c(seq(-1,1,.5)), align="l", vertical=TRUE, addlabels=TRUE, cex=0.8)
+
+dev.copy2pdf(file=paste(here::here("pics/"), "apollo_all_variables_padj0p05_shade.pdf", sep=""),width=12,height=8.5)
+dev.off()
+
+# Correlations between neutrophils and depression scores
+tmp$Padj["Neutrophils","Depression (HAM-D)"] # FDR p=0.00003
+tmp$r["Neutrophils","Depression (HAM-D)"] # rho=0.27
+
+tmp$Padj["Neutrophils","Depression (BDI)"] # p=0.0002
+tmp$r["Neutrophils","Depression (BDI)"] # rho=0.25
+
+```
+
+Supplementary correlation plot (Figure S3) - as above but MDD participants only
+```{r}
+
+yin <- c("ham_17_score","bdi_total_score","shaps_score_calc","chalder_fatigue_score","ctq_total_score","leq_z","s_anxiety_score","t_anxiety_score","antidepress_failed_75_less")
+labels_yin <- c("Depression (HAM-D)","Depression (BDI)","Anhedonia (SHAPS)","Chalder fatigue","Childhood trauma (CTQ)","Recent stress (LEQ)", "Stait anxiety (STAI-S)","Trait anxiety (STAI-T)","Antidepressant non-responses")
+names(labels_yin) <- yin
+
+forcor <- qm_combi[qm_combi$disorder=="MDD",c(choice_qset,"crp_macs","p_il_6_mean",yin,"age_at_bloods","bmi_calculated")]
+labels_cor <- c(labels_qset,labels_humor,labels_yin,"age_at_bloods"="age","bmi_calculated"="BMI")
+forcor %<>% plyr::rename(labels_cor)
+
+scalebluered <- colorRampPalette(brewer.pal(8, "RdBu"))(8)
+tmp <- Hmisc::rcorr(data.matrix(forcor), type="spearman")
+
+# Adjust correlation p values
+praw <- gdata::lowerTriangle(tmp$P)
+padjust <- p.adjust(praw, method="BH")
+
+tmp$Padj <- tmp$P
+gdata::lowerTriangle(tmp$Padj) <- padjust
+gdata::upperTriangle(tmp$Padj) = gdata::lowerTriangle(tmp$Padj, byrow=TRUE)
+
+corrplot::corrplot(tmp$r, method="shade", tl.pos="lt", type="full", tl.col="black", tl.cex=0.85, tl.srt=45, p.mat = tmp$Padj, sig.level=0.05, addgrid.col="grey", insig = "blank",cl.pos="n") + colorlegend(xlim=c(-10.8,-8.7), ylim=c(13.5,17.5), scalebluered, c(seq(-1,1,.5)), align="l", vertical=TRUE, addlabels=TRUE, cex=0.8)
+dev.copy2pdf(file=paste(here::here("pics/"), "apollo_all_variables_padj0p05_shade_MDD.pdf", sep=""),width=14,height=9)
+dev.off()
+
+```
+
+

@@ -1,0 +1,239 @@
+---
+title: "lynall03"
+output: html_document
+---
+
+## Contents
+- Antidepressant use figure (Figure S1A and S1B)
+- PCA plots in Figure S4
+- Figure 2: PC1 of cell counts vs. HAM-D and case-control status 
+- Figure 2: PC1 of cell counts correlation plot
+
+```{r}
+library(ggplot2)
+library(dplyr)
+library(reshape2)
+library(here)
+library(magrittr)
+
+options(scipen=5) 
+
+# Load data-driven consensus clustering
+load(file = paste(here::here("res/"),"Apollo_mdd_clust_out_meta.Rdata",sep=""))
+# Load full datasets of counts and clinical metrics
+load(file = paste(here::here("res/"),"Apollo_qm_combi.Rdata",sep=""))
+
+# absolute count names
+choice_qset <- c("q_rbc","q_platelet","q_baso","q_eosin","q_neut","q_mono_class","q_mono_int","q_mono_nonclass","q_cd4","q_cd8","q_b","q_nkt","q_nk16","q_nk56")
+labels_qset <- c(q_rbc="RBCs",q_platelet="Platelets",q_baso="Basophils",q_eosin="Eosinophils",q_neut="Neutrophils",q_mono_class="Mono (classical)",q_mono_int="Mono (int)",q_mono_nonclass="Mono (non-class)",q_cd4="CD4+ T",q_cd8="CD8+ T",q_b="B cells",q_nkt="NKT cells",q_nk16="CD16(hi) NK",q_nk56="CD56(hi) NK")
+
+```
+
+Figure S1: antidepressant non-responses
+
+```{r}
+m <- qm_combi
+
+ggplot(data=m[!is.na(m$antidepress_failed_75_less) & m$disorder=="MDD",], aes(x=antidepress_failed_75_less)) + geom_bar() + theme_bw()  + xlab("Number of antidepressant\nnon-responses") + ylab("Number of participants") + ggtitle("") 
+ggsave(file=paste(here::here("pics/"),"apollo_qm_combi_number_failed_75_less.pdf",sep=""), width=4,height=4)
+
+```
+
+Figure S1: antidepressant use by name 
+```{r}
+
+ggplot(data=mdd[!is.na(mdd$current_antidepress_name),], aes(x=current_antidepress_name)) + geom_bar() + theme_bw() + theme(axis.text.x=element_text(angle=90,hjust=1, vjust=0.5)) + xlab("Antidepressant") + ylab("Number of participants") + ggtitle("") 
+ggsave(file=paste(here::here("pics/"),"apollo_qm_combi_current_AD.pdf",sep=""), width=4,height=4)
+
+```
+
+PCA plots
+```{r}
+
+m <- qm_combi
+
+tmp <- m[,choice_qset]
+colnames(tmp) <- labels_qset
+pca.out <- prcomp(tmp,center=T,scale=T)
+
+# Flip
+pca.out$rotation[,1] %<>% "*"(-1)
+pca.out$x[,1] %<>% "*"(-1)
+
+# MAKE BIPLOTS with autoplot
+library(ggfortify)
+library(ggrepel)
+autoplot(pca.out, data=m, colour='disorder', label=FALSE, loadings=TRUE, loadings.label=TRUE, loadings.label.size=4, loadings.label.hjust=-0.1, loadings.label.repel=FALSE, frame = TRUE, frame.type="t", frame.colour = 'disorder') + scale_color_manual(values = c("dark grey","blue")) + theme_bw() + theme(legend.position = c(0.89,0.87),legend.background = element_rect(color = "black"), legend.title = element_blank()) + coord_equal() 
+ggsave(filename = paste(here::here("pics/"),"apollo_all_pca_by_disorder.pdf"), width=7,height=5) 
+
+# Now male PCA
+tmp <- m[m$sex=="male",choice_qset]
+colnames(tmp) <- labels_qset
+pca.out <- prcomp(tmp,center=T,scale=T)
+pca.out$rotation[,1] %<>% "*"(-1) # Flip for axis consistency
+pca.out$x[,1] %<>% "*"(-1)
+
+autoplot(pca.out, data=m[m$sex=="male",], colour='disorder', label=FALSE, loadings=TRUE, loadings.label=TRUE, loadings.label.repel=TRUE, frame = TRUE, frame.type="t", frame.colour = 'disorder') + scale_color_manual(values = c("dark grey","blue")) + theme_bw()   
+ggsave(filename = paste(here::here("pics/"),"apollo_male_pca_by_disorder.pdf"), width=7,height=5)
+
+# Female PCA
+tmp <- m[m$sex=="female",choice_qset]
+colnames(tmp) <- labels_qset
+pca.out <- prcomp(tmp,center=T,scale=T)
+autoplot(pca.out, data=m[m$sex=="female",], colour='disorder', label=FALSE, loadings=TRUE, loadings.label=TRUE, loadings.label.repel=TRUE, frame = TRUE, frame.type="t", frame.colour = 'disorder') + scale_color_manual(values = c("dark grey","blue")) + theme_bw() 
+ggsave(filename = paste(here::here("pics/"),"apollo_female_pca_by_disorder.pdf"), width=7,height=5)
+```
+
+Ordered PCA plot
+```{r}
+tmp <- m[,choice_qset]
+colnames(tmp) <- labels_qset
+pca.out <- prcomp(tmp,center=T,scale=T)
+pca.out$rotation[,1] %<>% "*"(-1)
+pca.out$x[,1] %<>% "*"(-1)
+
+eigen <- data.frame(pca.out$rotation[,1:2])
+colnames(eigen) = c("PC1","PC2")
+eigen$count <- rownames(eigen)
+
+# New sorting order
+desired_order <- rev(c("Neutrophils","Eosinophils","Basophils","Mono (non-class)","Mono (int)","Mono (classical)", "CD4+ T" ,"CD8+ T" ,"CD16(hi) NK","CD56(hi) NK","NKT cells","B cells" ,"RBCs","Platelets"))            
+
+# Re-order the levels
+eigen$count <- factor( as.character(eigen$count), levels=desired_order )
+# Re-order the data.frame
+eigen <- eigen[order(eigen$count),]
+
+ggplot(melt(eigen, value.name="Eigenvector"),aes(x=count,y=Eigenvector, fill=variable)) + geom_bar(stat="identity") + coord_flip() + scale_x_discrete(labels=labels_qset) + facet_grid(~variable, scales="free") + xlab("") + ylab("") + scale_fill_discrete(name = "Component") + guides(fill=FALSE) + theme_bw()
+ggsave(file=paste(here::here("pics/"),"apollo_all_pca_pca1and2.pdf",sep=""),width=4,height=3.5)
+
+dim(pca.out$x) 
+m <- data.frame(cbind(m,pca.out$x))
+
+# MALE - need to flip first two components 
+tmp <- m[m$sex=="male",choice_qset]
+colnames(tmp) <- labels_qset
+pca.out <- prcomp(tmp,center=T,scale=T)
+pca.out$rotation[,1:2] %<>% "*"(-1)
+pca.out$x[,1:2] %<>% "*"(-1)
+
+eigen <- data.frame(pca.out$rotation[,1:2])
+colnames(eigen) = c("PC1","PC2")
+eigen$count <- rownames(eigen)
+
+# Re-order the levels
+eigen$count <- factor( as.character(eigen$count), levels=desired_order )
+# Re-order the data.frame
+eigen <- eigen[order(eigen$count),]
+
+ggplot(melt(eigen, value.name="Eigenvector"),aes(x=count,y=Eigenvector, fill=variable)) + geom_bar(stat="identity") + coord_flip() + scale_x_discrete(labels=labels_qset) + facet_grid(~variable, scales="free") + xlab("") + ylab("") + scale_fill_discrete(name = "Component") + guides(fill=FALSE) + theme_bw()
+ggsave(file=paste(here::here("pics/"),"apollo_male_pca_pca1and2.pdf",sep=""),width=4,height=3.5)
+
+# FEMALE
+tmp <- m[m$sex=="female",choice_qset]
+colnames(tmp) <- labels_qset
+pca.out <- prcomp(tmp,center=T,scale=T)
+eigen <- data.frame(pca.out$rotation[,1:2])
+colnames(eigen) = c("PC1","PC2")
+eigen$count <- rownames(eigen)
+
+# Re-order the levels
+eigen$count <- factor( as.character(eigen$count), levels=desired_order )
+# Re-order the data.frame
+eigen <- eigen[order(eigen$count),]
+
+ggplot(melt(eigen, value.name="Eigenvector"),aes(x=count,y=Eigenvector, fill=variable)) + geom_bar(stat="identity") + coord_flip() + scale_x_discrete(labels=labels_qset) + facet_grid(~variable, scales="free") + xlab("") + ylab("") + scale_fill_discrete(name = "Component") + guides(fill=FALSE) + theme_bw()
+ggsave(file=paste(here::here("pics/"),"apollo_female_pca_pca1and2.pdf",sep=""),width=4,height=3.5)
+
+```
+
+
+FIGURE 2B
+Plot correlations of PC1 with clinical variables.
+```{r}
+yin <- c("ham_17_score","bdi_total_score","shaps_score_calc","chalder_fatigue_score","ctq_total_score","leq_z","s_anxiety_score","t_anxiety_score")
+labels_yin <- c("Depression (HAM-D)","Depression (BDI)","Anhedonia (SHAPS)","Chalder fatigue","Childhood trauma (CTQ)","Recent stress (LEQ)", "Stait anxiety (STAI-S)","Trait anxiety (STAI-T)")
+names(labels_yin) <- yin
+
+forcor <- m[,c("PC1","crp_macs","p_il_6_mean",yin,"age_at_bloods","bmi_calculated")]
+labels_cor <- c("PC1"="Cellular PC1","crp_macs"="CRP","p_il_6_mean"="IL-6",labels_yin,"age_at_bloods"="age","bmi_calculated"="BMI")
+forcor %<>% plyr::rename(replace=labels_cor)
+
+library(RColorBrewer)
+library(corrplot)
+scalebluered <- colorRampPalette(brewer.pal(8, "RdBu"))(8)
+
+# Smaller version - FIGURE
+tmp <- Hmisc::rcorr(data.matrix(forcor), type="spearman")
+dim(tmp$P)
+# Adjust correlation p values (only interested in correlations with clinical variables i.e. the 1st 33 p values)
+praw <- gdata::lowerTriangle(tmp$P)
+padjust <- p.adjust(praw[1:33], method="BH")
+
+tmp$Padj <- tmp$P
+gdata::lowerTriangle(tmp$Padj)[1:33] <- padjust
+gdata::upperTriangle(tmp$Padj) = gdata::lowerTriangle(tmp$Padj, byrow=TRUE)
+
+tmp <- lapply(tmp,"[",labels_cor, c("Cellular PC1","CRP","IL-6"))
+
+corrplot::corrplot(tmp$r, method="shade", tl.pos="lt", type="full", tl.col="black", tl.cex=0.95, tl.srt=45, p.mat = tmp$Padj, sig.level=0.05, addgrid.col="grey", shade.lwd=0.001, insig = "blank",cl.pos="n") + colorlegend(xlim=c(-8.8,-6.7), ylim=c(11.5,15.5), scalebluered, c(seq(-1,1,.5)), align="l", vertical=TRUE, addlabels=TRUE, cex=0.8)
+dev.copy2pdf(file=paste(here::here("pics/"), "apollo_pca_corr_all_padj0p05_smaller.pdf", sep=""),width=6.5,height=5)
+
+# Now get the actual values for the correlations:
+tmp$Padj["CRP","Cellular PC1"] # p=0.00004
+tmp$r["CRP","Cellular PC1"] # rho=0.26
+
+tmp$Padj["IL-6","Cellular PC1"] # p=0.000004
+tmp$r["IL-6","Cellular PC1"] # rho=0.34
+
+tmp$Padj["Depression (HAM-D)","Cellular PC1"] # p=0.00004
+tmp$r["Depression (HAM-D)","Cellular PC1"] # rho=0.26
+
+tmp$Padj["Depression (BDI)","Cellular PC1"] # p=0.0002
+tmp$r["Depression (BDI)","Cellular PC1"] # rho=0.24
+
+tmp$Padj["Anhedonia (SHAPS)","Cellular PC1"] # p=0.0004
+tmp$r["Anhedonia (SHAPS)","Cellular PC1"] # rho=0.23
+
+tmp$Padj["BMI","Cellular PC1"] # p=0.00004
+tmp$r["BMI","Cellular PC1"] # rho=0.26
+
+
+```
+
+
+
+Function for wilcox test including effect size
+```{r}
+
+mel_wilcox <- function(formula, data=NULL){
+  require(coin)
+  w2 <- coin::wilcox_test(formula,data=data, distribution="exact", conf.int=TRUE)
+  out <- c()
+  out$n <- length(w2@statistic@block)
+  out$y <- table(w2@statistic@x)
+  out$formula <- formula
+  out$estimate <- confint(w2)$estimate
+  out$effect.size <- statistic(w2) / sqrt ( out$n )
+  out$p.value <- coin::pvalue(w2)
+  return(out) 
+}  
+
+```
+
+PC1 scores: control vs MDD
+```{r}
+shapiro.test(m$PC1) # Not normal
+
+library(coin)
+
+tmp <- mel_wilcox(PC1~disorder,data=m)
+print(tmp) # diff location estimate -0.54, effect size = 0.16, p=0.006
+write.csv(capture.output(tmp), file=paste(here::here("res/"),"exp037_pc1_by_disorder.txt",sep=""), row.names = FALSE, quote=FALSE)
+
+ggplot(data=m,aes(x=disorder,y=PC1)) + geom_violin(aes(fill=disorder)) + geom_boxplot(outlier.shape=NA, notch=FALSE, width=0.2) + guides(fill=FALSE) + scale_fill_manual(values=c("light grey","dark blue"))
+ggsave(file=paste(here::here("pics/"),"exp037_pc1_vs_disorder.pdf",sep=""),width=2,height=3)
+
+```
+
+

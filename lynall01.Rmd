@@ -1,0 +1,218 @@
+---
+title: "lynall01"
+output: html_document
+---
+## Contents:
+- Figure 3: PLS-DA and PLS-R
+
+```{r}
+
+set.seed(222)
+
+library(ggplot2)
+library(dplyr)
+library(ggsignif)
+library(tidyr)
+library(here)
+library(magrittr) 
+library(reshape2)
+library(R.utils)
+library(ropls)
+library(boot)
+library(ggrepel)
+
+options(scipen=5) 
+
+# qm_combi is the full dataset of counts and clinical data
+load(file=paste(here::here("res/"),"Apollo_qm_combi.RData",sep=""))
+
+# Cell types and names
+choice_qset <- c("q_rbc","q_platelet","q_baso","q_eosin","q_neut","q_mono_class","q_mono_int","q_mono_nonclass","q_cd4","q_cd8","q_b","q_nkt","q_nk16","q_nk56")
+labels_qset <- c(q_rbc="RBCs",q_platelet="Platelets",q_baso="Basophils",q_eosin="Eosinophils",q_neut="Neutrophils",q_mono_class="Mono (classical)",q_mono_int="Mono (int)",q_mono_nonclass="Mono (non-class)",q_cd4="CD4+ T",q_cd8="CD8+ T",q_b="B cells",q_nkt="NKT cells",q_nk16="CD16(hi) NK",q_nk56="CD56(hi) NK")
+
+```
+
+```{r}
+m <- qm_combi
+
+```
+
+PLS
+predictors = 14 cell counts
+response = clinical scores OR MDD vs. control status
+
+```{r}
+
+# Function to get weights for PLS
+  getweight <- function(data,ind){
+    x <- data[ind,] 
+    m.pls <- opls(x[,choice_qset],as.matrix(x[,yin]), permI=0, predI=1, printL=FALSE, plotL=FALSE)
+    tmp <- getWeightMN(m.pls)
+    return(tmp)
+  }
+  
+# Function for multivariate permutation testing modified from getMethod("opls”,"matrix”)
+plsr_multivariate_perm <- function(opl, permI){
+  modSumVc <- colnames(opl@summaryDF)
+  permMN <- matrix(0, nrow = 1 + permI, ncol = length(modSumVc), 
+                   dimnames = list(NULL, modSumVc))
+  perSimVn <- numeric(1 + permI)
+  perSimVn[1] <- 1
+  permMN[1, ] <- as.matrix(opl@summaryDF)
+  for (k in 1:permI) {
+    yVcn <- drop(opl@suppLs[["yMCN"]]) # Matrix of outcomes
+    yPerVcn <- yVcn[sample(nrow(yVcn)),] # Permute the rows. Will maintain the interdependencies.
+    yPerMCN <- as.matrix(yPerVcn)
+    rownames(yPerMCN) <- NULL 
+    predI <- opl@summaryDF$pre 
+    perOpl <- opls(yPerMCN,as.matrix(full[,yin]), plotL=FALSE, predI=predI, printL=FALSE) 
+    permMN[1 + k, ] <- as.matrix(perOpl@summaryDF)
+  }
+  perPvaVn <- c(pR2Y = (1 + length(which(permMN[-1, "R2Y(cum)"] >= permMN[1, "R2Y(cum)"])))/(nrow(permMN) - 1), # number of perm R2Y(cum) above actual R2Y(cum)
+                pQ2 = (1 + length(which(permMN[-1, "Q2(cum)"] >= permMN[1, "Q2(cum)"])))/(nrow(permMN) - 1)) # number of Q2(cum) above actual R2Y(cum)
+  opl@summaryDF[, "pR2Y"] <- perPvaVn["pR2Y"]
+  opl@summaryDF[, "pQ2"] <- perPvaVn["pQ2"]
+  opl@suppLs[["permMN"]] <- permMN
+  return(opl)
+}
+
+```
+
+PLS-R: cell counts predicting symptom scores
+```{r}
+yin <- c("ham_17_score","bdi_total_score","shaps_score_calc","chalder_fatigue_score")
+labels_yin <- c("HAM Depression","Beck Depression","SHAPS anhedonia","Chalder fatigue")
+full <- m[complete.cases(m[,c(yin,choice_qset)]) & m$disorder=="MDD", ]
+rownames(full) <- full$name
+
+set.seed(111)
+m.pls <- opls(full[,choice_qset],as.matrix(full[,yin]), plotL=FALSE) # Sinlge componenet model
+m.pls.with.perm <- plsr_multivariate_perm(m.pls, permI=5000)
+m.pls.with.perm
+
+# PLS APOLLO
+#PLS
+#199 samples x 14 variables and 4 responses
+#standard scaling of predictors and response(s)
+#      R2X(cum) R2Y(cum) Q2(cum) RMSEE pre ort   pR2Y    pQ2
+#Total    0.172   0.0734  0.0311  7.31   1   0 0.0002 0.0012
+
+m.pls@modelDF
+rev(sort(getVipVn(m.pls))) 
+
+set.seed(222)
+boot.out <- boot(full,getweight,R=1000) 
+
+# Z-scores
+boot.z <- boot.out$t0 / apply(boot.out$t,2,sd) 
+boot.z[rev(order(boot.z)),]
+
+m.pls.two <- opls(full[,choice_qset],as.matrix(full[,yin]), permI=1,predI=2, plotL=FALSE)
+
+# Scores plot 
+ggplot(data=as.data.frame(m.pls.two@scoreMN),aes(x=p1,y=p2)) + geom_point(aes(colour=full$disorder)) + ggtitle("")  + theme_bw() + geom_hline(yintercept =0) + geom_vline(xintercept=0) + stat_ellipse() + xlab("Component 1") + ylab("Component 2") 
+ggsave(file=paste(here::here("pics/"),"apollo_pls_matrix_symptoms_scores_mdd_nonreg.pdf",sep=""), width=7, height=5) 
+
+# Weights
+tmp <- as.data.frame(m.pls.two@weightStarMN)
+tmp$component <- "predictor"
+tmp$boot.z <- boot.z
+tmp2 <- as.data.frame(m.pls.two@cMN)
+tmp2$component <- "response"
+tmp2$boot.z <- 999 # Set >3 so to ensure printed
+(weights_combi <- bind_rows(tmp, tmp2))
+weights_combi$label <- c(labels_qset,labels_yin)
+
+# Weights plot: Figure 3b
+fig3b <- ggplot(data=weights_combi,aes(x=p1,y=p2, colour=component, label=label)) + geom_point() + ggtitle("")  + theme_bw() + geom_hline(yintercept =0) + geom_vline(xintercept=0) + xlab("Component 1") + ylab("Component 2") + guides(color=guide_legend(title="Variables")) + geom_label_repel(data=dplyr::filter(weights_combi,boot.z>3),aes(x=p1,y=p2, colour=component)) + expand_limits(y=c(0.45), x=c(0.55)) + scale_color_manual(values=c("dark green","purple")) + theme(legend.position = c(0.85,0.15),legend.background = element_rect(color = "black"), legend.title = element_blank()) 
+
+```
+
+PLS-DA for case vs. control status
+```{r}
+
+yin <- "disorder"
+labels_yin <- "MDD vs. control"
+
+full <- m[complete.cases(m[,c(yin,choice_qset)] ), ]
+rownames(full) <- full$name
+
+# Weighted centering of columns
+weighted_mean <- full[,c("disorder",choice_qset)] %>% group_by(disorder) %>% summarise_at(vars(one_of(choice_qset)),mean) %>% summarise_at(vars(one_of(choice_qset)),function(x){sum(x)/2}) %>% as.numeric(.[1,]) 
+names(weighted_mean) <- choice_qset
+
+xSdVn <- apply(full[,choice_qset], 2, function(colVn) sd(colVn, na.rm = TRUE))
+wced <- scale(full[,choice_qset], center = weighted_mean, scale = xSdVn) # 
+wced %<>% data.frame
+wced$disorder <- full$disorder
+  
+# PLS-DA 
+set.seed(111)
+m.pls.wced <- opls(wced[,choice_qset],full[,yin], permI=5000, scaleC="none") # As have already weighted centred above, don't scale within the model
+m.pls.wced
+
+# Force 2 for plot
+m.pls.wced <- opls(wced[,choice_qset],full[,yin], permI=5000, scaleC="none") # As have already weighted centred above, don't scale within the model
+m.pls.wced
+
+#PLS-DA APOLLO
+#283 samples x 14 variables and 1 response
+#none scaling of predictors and standard scaling of response(s)
+#      R2X(cum) R2Y(cum) Q2(cum) RMSEE pre ort   pR2Y    pQ2
+#Total    0.168   0.0631  0.0347 0.432   1   0 0.0792 0.0022
+# Using pQ2 for significance - an estimate of the predictive performance of the model by cross-validation. Less interested in R2 (percentage explained) which just increases with the number of components.
+
+# Bootstrap z-scores
+boot.out <- list()
+  
+  getweight.wced <- function(data,ind){
+    x <- data[ind,] 
+    m.pls <- opls(x[,choice_qset],as.matrix(x[,yin]), permI=1, predI=1, printL=FALSE, plotL=FALSE,scaleC="none")
+    tmp <- getWeightMN(m.pls)
+    return(tmp)
+  }
+  set.seed(999)
+  boot.out.wced <- boot(wced,getweight.wced,R=1000)
+  
+# Ratio of weight of each predictor variable to bootstrap standard error and rank predictor variables with |Z|>3
+boot.z.wced <- boot.out.wced$t0 / apply(boot.out.wced$t,2,sd) # Divide weight by the standard error
+boot.z.wced[rev(order(boot.z.wced)),] 
+
+# Now force two-component model for weights and scores plots
+m.pls.wced.two <- opls(wced[,choice_qset],as.matrix(full[,yin]), permI=1,predI=2, plotL=FALSE, scaleC="none")
+
+# Scores plot
+ggplot(data=as.data.frame(m.pls.wced.two@scoreMN),aes(x=p1,y=p2, color=full$disorder)) + geom_point(aes(colour=full$disorder)) + ggtitle("")  + theme_bw() + geom_hline(yintercept =0) + geom_vline(xintercept=0) + stat_ellipse() + guides(color=guide_legend(title="Group")) + scale_color_manual(values=c("dark grey","red")) + xlab("Component 1") + ylab("Component 2") + theme(legend.position = c(0.85,0.15),legend.background = element_rect(color = "black"), legend.title = element_blank()) 
+ggsave(file=paste(here::here("pics/"),"apollo_pls_mdd_scores_nonreg_weightedscaling.pdf",sep=""), width=5,height=5.4) 
+
+# Weights plot
+tmp <- as.data.frame(m.pls.wced.two@weightStarMN)
+tmp$component <- "predictor"
+tmp$boot.z <- boot.z.wced
+tmp2 <- as.data.frame(m.pls.wced.two@cMN)
+tmp2$component <- "response"
+tmp2$boot.z <- 999 # Set >3 to force printing
+weights_combi.wced <- bind_rows(tmp, tmp2) 
+weights_combi.wced$label <- c(labels_qset,labels_yin)
+print(weights_combi.wced) 
+
+# only show the labels for significant loadings
+fig3a <- ggplot(data=weights_combi.wced,aes(x=p1,y=p2, colour=component, label=label)) + geom_point() + ggtitle("")  + theme_bw() + geom_hline(yintercept =0) + geom_vline(xintercept=0) + guides(color=guide_legend(title="Variables")) + expand_limits(x=c(0,0.4),y=c(0,0.4)) + geom_label_repel(data=dplyr::filter(weights_combi.wced,boot.z>3),aes(x=p1,y=p2, colour=component)) + scale_color_manual(values=c("dark green","purple")) + xlab("Component 1") + ylab("Component 2") + theme(legend.position = c(0.85,0.15),legend.background = element_rect(color = "black"), legend.title = element_blank())  
+
+```
+
+Figure 3
+```{r}
+
+g <- cowplot::plot_grid(fig3a,fig3b,ncol=2, rel_heights = c(1,1), rel_widths = c(1,1), align = "hv")
+ggsave(g, file=paste(here::here("pics/"),"apollo_bothpls_figure3.pdf",sep=""),width=10,height=5)
+```
+
+```{r}
+sessionInfo()
+```
+
+
+
+
+
